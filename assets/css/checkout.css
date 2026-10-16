@@ -1,0 +1,6 @@
+/* Hides LearnPress's hard-coded "Please login in to enroll in the course!" box (templates/checkout/form.php).
+   It's always the first child for logged-out visitors, and LearnPress has no filter for it.
+   Real checkout errors print after it, so they stay visible. */
+body:not(.logged-in) #learn-press-checkout > .learn-press-message.error:first-child {
+	display: none;
+}

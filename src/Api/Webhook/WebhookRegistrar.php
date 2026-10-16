@@ -1,0 +1,147 @@
+<?php
+/**
+ * Webhook callback registration with ifthenpay.
+ *
+ * @package Ifthenpay\LearnPress
+ */
+
+declare(strict_types=1);
+
+namespace Ifthenpay\LearnPress\Api\Webhook;
+
+use Ifthenpay\LearnPress\Admin\SettingsSection;
+use Ifthenpay\LearnPress\Api\IfthenpayClient;
+use Ifthenpay\LearnPress\Cron\ExpiredPaymentsCron;
+use Ifthenpay\LearnPress\Plugin;
+use Ifthenpay\LearnPress\Repository\SettingsRepository;
+
+if ( ! defined( 'ABSPATH' ) ) {
+	exit;
+}
+
+/**
+ * Registers the callback URL with ifthenpay, and again when it drifts (permalink or REST prefix change, domain
+ * migration), since ifthenpay keeps calling the old one.
+ */
+class WebhookRegistrar {
+
+	/**
+	 * Throttles re-sync attempts while ifthenpay keeps rejecting them.
+	 */
+	public const RETRY_LOCK = 'iftp_lp_callback_resync_lock';
+
+	/**
+	 * Settings storage.
+	 *
+	 * @var SettingsRepository
+	 */
+	private SettingsRepository $settings;
+
+	/**
+	 * Ifthenpay API client.
+	 *
+	 * @var IfthenpayClient
+	 */
+	private IfthenpayClient $client;
+
+	/**
+	 * Sets up the registrar.
+	 *
+	 * @param SettingsRepository   $settings Settings storage.
+	 * @param IfthenpayClient|null $client   Ifthenpay API client.
+	 */
+	public function __construct( SettingsRepository $settings, ?IfthenpayClient $client = null ) {
+		$this->settings = $settings;
+		$this->client   = $client ?? new IfthenpayClient();
+	}
+
+	/**
+	 * Wires up the drift check.
+	 */
+	public function register(): void {
+		add_action( 'admin_init', array( $this, 'maybe_resync' ) );
+
+		// The daily sweep catches drift too, for when no admin opens our settings after a migration.
+		add_action( ExpiredPaymentsCron::HOOK, array( $this, 'resync_if_drifted' ) );
+	}
+
+	/**
+	 * Registers (or re-registers) the callback for a Gateway Key.
+	 * I reuse the existing anti-phishing key; rotating it would break callbacks for payments in flight.
+	 *
+	 * @param string $gateway_key The Gateway Key to register the callback for.
+	 */
+	public function register_webhook( string $gateway_key ): bool {
+		if ( '' === $gateway_key ) {
+			return false;
+		}
+
+		$anti_phishing_key = $this->settings->get_anti_phishing_key( $gateway_key );
+		$is_new            = '' === $anti_phishing_key;
+
+		if ( $is_new ) {
+			$anti_phishing_key = wp_generate_password( 32, false, false );
+		}
+
+		if ( ! $this->client->activate_callback( $gateway_key, $anti_phishing_key, WebhookController::url() ) ) {
+			return false;
+		}
+
+		// Only stored once ifthenpay accepted it, otherwise it's still calling back with the old key.
+		if ( $is_new ) {
+			$this->settings->set_anti_phishing_key( $gateway_key, $anti_phishing_key );
+		}
+
+		$this->settings->set_callback_hash( self::hash( $gateway_key ) );
+
+		return true;
+	}
+
+	/**
+	 * Runs the drift check on our LearnPress settings section, not on every wp-admin page.
+	 */
+	public function maybe_resync(): void {
+		// The settings AJAX handlers register on their own, so I skip them here.
+		if ( wp_doing_ajax() || ! current_user_can( Plugin::admin_cap() ) ) {
+			return;
+		}
+
+		if ( ! SettingsSection::is_screen() ) {
+			return;
+		}
+
+		$this->resync_if_drifted();
+	}
+
+	/**
+	 * Re-registers the callback when the URL no longer matches the one ifthenpay accepted. Just a hash compare on the happy path.
+	 */
+	public function resync_if_drifted(): void {
+		$gateway_key = $this->settings->get_gateway_key();
+
+		if ( '' === $gateway_key ) {
+			return;
+		}
+
+		// A missing anti-phishing key also needs a resync, or the validator rejects every callback.
+		$in_sync = self::hash( $gateway_key ) === $this->settings->get_callback_hash()
+			&& '' !== $this->settings->get_anti_phishing_key( $gateway_key );
+
+		if ( $in_sync || false !== get_transient( self::RETRY_LOCK ) ) {
+			return;
+		}
+
+		if ( ! $this->register_webhook( $gateway_key ) ) {
+			set_transient( self::RETRY_LOCK, 1, 15 * MINUTE_IN_SECONDS );
+		}
+	}
+
+	/**
+	 * A hash rather than the URL itself — a migration's search-replace would rewrite a stored URL to the new domain and hide the drift.
+	 *
+	 * @param string $gateway_key The Gateway Key the callback is registered for.
+	 */
+	private static function hash( string $gateway_key ): string {
+		return md5( $gateway_key . '|' . WebhookController::url() );
+	}
+}
